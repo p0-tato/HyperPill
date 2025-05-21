@@ -11,6 +11,7 @@ enum cmds {
 	OP_PCI_WRITE,
 	OP_MSR_WRITE,
 	OP_VMCALL,
+	OP_HVCALL_POSTMESSAGE,
 	OP_CLOCK_STEP,
 };
 
@@ -754,6 +755,128 @@ bool op_vmcall() {
 	return true;
 }
 
+bool op_hvcall_post_message() {
+    uint32_t connection_id;
+    uint32_t message_type;
+    uint32_t payload_size;
+    uint8_t message_payload[240]; // TLFS 명시된 최대 페이로드 크기
+    bx_phy_address param_gpa;     // L2 게스트 메모리에 파라미터 블록을 저장할 GPA
+
+    // --- 1. 파라미터 블록으로 사용할 L2 GPA를 스크래치 리스트에서 무작위 선택 ---
+    if (guest_page_scratchlist.empty()) {
+        printf("Error: No scratch pages available for HvCallPostMessage params.\n");
+        return false; 
+    }
+    uint8_t scratch_page_index = 0;
+    if (guest_page_scratchlist.size() > 1) { 
+        // 입력 스트림에서 인덱스 값을 읽어옴 (0 ~ 리스트크기-1 범위)
+        if (ic_ingest8(&scratch_page_index, 0, guest_page_scratchlist.size() - 1)) {
+             scratch_page_index = 0; 
+        }
+    }
+    param_gpa = guest_page_scratchlist[scratch_page_index];
+
+    // 2. 퍼저 입력으로부터 하이퍼콜 파라미터 값들 읽기 (ic_ingest* 사용)
+    if (ic_ingest32(&connection_id, 0, 0xFFFFFFFF)) return false;
+    if (ic_ingest32(&message_type, 1, 0x7FFFFFFF)) return false; 
+    if (ic_ingest32(&payload_size, 0, 240)) return false; 
+    if (payload_size > 0) {
+        uint8_t* ingested_payload_ptr = ic_ingest_len(payload_size);
+        if (!ingested_payload_ptr) return false;
+        memcpy(message_payload, ingested_payload_ptr, payload_size);
+    }
+
+    // 3. L2 게스트 메모리(param_gpa)에 파라미터 블록 구성
+    bx_address param_hpa;
+    int translation_level;
+    if (vmcs_translate_guest_physical_ept(param_gpa, &param_hpa, &translation_level) != 0) {
+        printf("Error: Failed to translate GPA 0x%llx for HvCallPostMessage params.\n", (unsigned long long)param_gpa);
+        return false; 
+    }
+    uint32_t rsvdz_at_offset4 = 0;
+    cpu_physical_memory_write(param_hpa + 0,  &connection_id, sizeof(connection_id));
+    cpu_physical_memory_write(param_hpa + 4,  &rsvdz_at_offset4, sizeof(rsvdz_at_offset4));
+    cpu_physical_memory_write(param_hpa + 8,  &message_type, sizeof(message_type));
+    cpu_physical_memory_write(param_hpa + 12, &payload_size, sizeof(payload_size));
+    if (payload_size > 0) {
+        cpu_physical_memory_write(param_hpa + 16, message_payload, payload_size);
+    }
+    
+    // 4. RCX (하이퍼콜 입력 값) 및 RDX (파라미터 GPA) 설정 준비
+    uint64_t hypercall_input_value = 0x005C; 
+    memcpy(vmcall_gpregs, BX_CPU(id)->gen_reg, sizeof(BX_CPU(id)->gen_reg)); 
+    vmcall_gpregs[BX_64BIT_REG_RCX].rrx = hypercall_input_value;
+    vmcall_gpregs[BX_64BIT_REG_RDX].rrx = param_gpa;             
+    // vmcall_gpregs[BX_64BIT_REG_R8].rrx = 0; 
+
+    // 5. VMCALL 주입 및 실행 준비
+    BX_CPU(id)->VMwrite32(VMCS_32BIT_VMEXIT_REASON, VMX_VMEXIT_VMCALL);
+    BX_CPU(id)->VMwrite32(VMCS_32BIT_VMEXIT_INSTRUCTION_LENGTH, 3);
+    bx_address phy_guest_rip;
+    if (vmcs_linear2phy(BX_CPU(id)->VMread64(VMCS_GUEST_RIP), &phy_guest_rip) == 0) {
+        printf("Error: Failed to translate GUEST_RIP for VMCALL injection.\n");
+        return false;
+    }
+    cpu_physical_memory_write(phy_guest_rip, "\x0f\x01\xc1", 3); 
+
+    // 6. 준비된 레지스터 값을 실제 Bochs CPU 레지스터로 복사
+    memcpy(BX_CPU(id)->gen_reg, vmcall_gpregs, sizeof(BX_CPU(id)->gen_reg));
+
+    // --- 입력 재구성을 위한 DMA 데이터 캡처 준비 ---
+    // start_cpu() 호출 직전에 output 버퍼의 현재 커서 위치를 기록합니다.
+    // fuzz_dma_read_cb 내의 ic_ingest_buf 호출은 이 커서 이후로 output에 DMA 데이터를 추가합니다.
+    uint8_t *dma_data_output_start_cursor = ic_get_cursor();
+
+    // 7. CPU 에뮬레이션 시작
+    start_cpu(); 
+
+    // 8. 하이퍼콜 반환 값(RAX) 확인 (선택적 로깅)
+    uint64_t rax_return_value = BX_CPU(id)->get_reg64(BX_64BIT_REG_RAX);
+    uint16_t hv_status = (uint16_t)(rax_return_value & 0xFFFF);
+    if (BX_CPU(id)->fuzztrace || log_ops || hv_status != HV_STATUS_SUCCESS) { /* 로깅 */ }
+
+    // --- 9. 입력 재구성 로직 (op_vmcall과 유사하게) ---
+    // VMCALL 실행 중 fuzz_dma_read_cb에 의해 output 버퍼에 추가되었을 수 있는 DMA 데이터 길이 계산
+    uint8_t *dma_data_output_end_cursor = ic_get_cursor();
+    size_t dma_data_length_in_output = dma_data_output_end_cursor - dma_data_output_start_cursor;
+    
+    uint8_t temp_dma_buffer[4096]; // 임시 DMA 버퍼
+    if (dma_data_length_in_output > sizeof(temp_dma_buffer)) {
+        printf("Warning: DMA data too large for temp_dma_buffer in op_hvcall_post_message.\n");
+        dma_data_length_in_output = sizeof(temp_dma_buffer); // 잘림 방지
+    }
+    if (dma_data_length_in_output > 0) {
+        memcpy(temp_dma_buffer, dma_data_output_start_cursor, dma_data_length_in_output);
+    }
+
+    // 현재 작업(이 op_hvcall_post_message)을 위해 output 버퍼에 추가된 모든 내용을
+    // (마지막 SEPARATOR 이후부터 현재 커서까지) 일단 삭제합니다.
+    ic_erase_backwards_until_token(); 
+
+    uint8_t current_opcode = OP_HVCALL_POSTMESSAGE;
+    if (!ic_append(&current_opcode, sizeof(current_opcode))) goto reconstruction_error;
+
+    // 사용된 파라미터 값들을 순서대로 output 버퍼에 추가
+    if (!ic_append(&scratch_page_index, sizeof(scratch_page_index))) goto reconstruction_error;
+    if (!ic_append(&connection_id, sizeof(connection_id))) goto reconstruction_error;
+    if (!ic_append(&message_type, sizeof(message_type))) goto reconstruction_error;
+    if (!ic_append(&payload_size, sizeof(payload_size))) goto reconstruction_error;
+    if (payload_size > 0) {
+        if (!ic_append(message_payload, payload_size)) goto reconstruction_error;
+    }
+
+    // 이 하이퍼콜 실행 중에 소비/주입된 DMA 데이터가 있다면, 그것도 output 버퍼에 추가
+    if (dma_data_length_in_output > 0) {
+        if (!ic_append(temp_dma_buffer, dma_data_length_in_output)) goto reconstruction_error;
+    }
+
+    return true; // 작업 성공
+
+reconstruction_error:
+    fuzz_emu_stop_unhealthy(); // 입력 재구성 실패 시 비정상 종료 처리
+    return false;
+}
+
 bool op_clock_step() {
 	if (!getenv("END_WITH_CLOCK_STEP")) {
 		printf("END_WITH_CLOCK_STEP is not set.\n");
@@ -784,53 +907,82 @@ void fuzz_run_input(const uint8_t *Data, size_t Size) {
 		[OP_PCI_WRITE] = op_pci_write,
 		[OP_MSR_WRITE] = op_msr_write,
 		[OP_VMCALL] = op_vmcall,
+		[OP_HVCALL_POSTMESSAGE] = op_hvcall_post_message,
 	};
 	static const int nr_ops = sizeof(ops) / sizeof((ops)[0]);
 	uint8_t op;
 
 	static void *fuzz_legacy, *fuzz_hypercalls, *end_with_clockstep;
 	static int inited;
-	if (!inited) {
-		inited = 1;
-		fuzz_legacy = getenv("FUZZ_LEGACY");
-		fuzz_hypercalls = getenv("FUZZ_HYPERCALLS");
-		end_with_clockstep = getenv("END_WITH_CLOCK_STEP");
-		log_ops = getenv("LOG_OPS") || BX_CPU(id)->fuzztrace;
-	}
+	static bool is_hyperv_target = false;
+
+    if (!inited) {
+        inited = 1;
+        fuzz_legacy = getenv("FUZZ_LEGACY");
+        fuzz_hypercalls = getenv("FUZZ_HYPERCALLS");
+        end_with_clockstep = getenv("END_WITH_CLOCK_STEP");
+        log_ops = getenv("LOG_OPS") || BX_CPU(id)->fuzztrace;
+        
+        const char* hyperv_env = getenv("HYPERV");
+        if (hyperv_env && strcmp(hyperv_env, "1") == 0) {
+            is_hyperv_target = true;
+            printf("INFO: HYPERV target mode enabled for op selection.\n");
+        } else {
+            printf("INFO: HYPERV target mode disabled for op selection.\n");
+        }
+    }
 
 	//if (log_ops)
 		//printf("!new input (length %d)\n", Size);
 	ic_new_input(Data, Size);
 	uint16_t start = 0;
-	int nops = 0;
+	// int nops = 0;
 	uint8_t *input_start = ic_get_cursor();
 	do {
 		dma_start = ic_get_cursor() - input_start;
 		dma_len = 0;
+
+        uint8_t min_op_for_ingest;
+        uint8_t max_op_for_ingest;
+
+		uint8_t max_op_code = OP_HVCALL_POSTMESSAGE;
 		if (fuzz_legacy) {
-			if (ic_ingest8(&op, OP_READ, OP_OUT, true)) {
-				ic_erase_backwards_until_token();
-				ic_subtract(4);
-				continue;
-			}
+            min_op_for_ingest = OP_READ;
+            max_op_for_ingest = OP_OUT;
 		} else if (fuzz_hypercalls) {
-			if (ic_ingest8(&op, OP_MSR_WRITE, OP_VMCALL, true)) {
-				ic_erase_backwards_until_token();
-				ic_subtract(4);
-				continue;
-			}
+            min_op_for_ingest = OP_MSR_WRITE;
+            if (is_hyperv_target) {
+                // HYPERV=1이면, OP_HVCALL_POSTMESSAGE까지 작업 선택 가능
+                max_op_for_ingest = OP_HVCALL_POSTMESSAGE; 
+            } else {
+                // HYPERV=1이 아니면, OP_VMCALL까지만 작업 선택 가능
+                max_op_for_ingest = OP_VMCALL; 
+            }
 		} else { /* Fuzz Everything */
-			if (ic_ingest8(&op, 0, OP_VMCALL, true)) {
-				ic_erase_backwards_until_token();
-				ic_subtract(4);
-				continue;
-			}
+            min_op_for_ingest = 0; // 가장 작은 작업 코드부터
+            if (is_hyperv_target) {
+                // HYPERV=1이면, OP_HVCALL_POSTMESSAGE까지 작업 선택 가능
+                // (OP_CLOCK_STEP은 이 로직에서 제외하고, 루프 후 별도 처리)
+                max_op_for_ingest = OP_HVCALL_POSTMESSAGE; 
+            } else {
+                // HYPERV=1이 아니면, OP_VMCALL까지만 작업 선택 가능
+                // (OP_HVCALL_POSTMESSAGE는 이 범위에서 제외됨)
+                max_op_for_ingest = OP_VMCALL;
+            }
 		}
-		if (!ops[op]()) {
-			ic_erase_backwards_until_token();
-			ic_subtract(4);
-			continue;
-		}
+
+        if (ic_ingest8(&op, min_op_for_ingest, max_op_for_ingest, true)) {
+            goto handle_op_failure_and_continue;
+        }
+
+        size_t num_defined_ops = sizeof(ops) / sizeof(ops[0]);
+        if (op >= num_defined_ops || !ops[op] || !ops[op]()) { 
+        handle_op_failure_and_continue:
+            ic_erase_backwards_until_token();
+            ic_subtract(4); 
+            continue;
+        }
+		
 		if (fuzz_unhealthy_input || fuzz_do_not_continue)
 			break;
 		if (new_op(op, start, ic_get_cursor() - input_start, dma_start,
