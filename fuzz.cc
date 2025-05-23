@@ -12,6 +12,7 @@ enum cmds {
 	OP_MSR_WRITE,
 	OP_VMCALL,
 	OP_HVCALL_POSTMESSAGE,
+	OP_HVCALL_SIGNALEVENT,
 	OP_CLOCK_STEP,
 };
 
@@ -756,7 +757,7 @@ bool op_vmcall() {
 }
 
 bool op_hvcall_post_message() {
-    uint32_t connection_id;
+    uint32_t connection_id_val; // HV_CONNECTION_ID의 AsUInt32에 해당, 상위 8비트는 0으로 처리될 예정
     uint32_t message_type;
     uint32_t payload_size;
     uint8_t message_payload[240]; // TLFS 명시된 최대 페이로드 크기
@@ -770,16 +771,27 @@ bool op_hvcall_post_message() {
     uint8_t scratch_page_index = 0;
     if (guest_page_scratchlist.size() > 1) { 
         // 입력 스트림에서 인덱스 값을 읽어옴 (0 ~ 리스트크기-1 범위)
+        // ic_ingest8은 output 버퍼에도 이 값을 추가함 (입력 재구성 시 활용)
         if (ic_ingest8(&scratch_page_index, 0, guest_page_scratchlist.size() - 1)) {
+             // 입력 부족 시 기본값(0) 사용 또는 실패 처리. 여기서는 0으로 진행.
              scratch_page_index = 0; 
         }
     }
     param_gpa = guest_page_scratchlist[scratch_page_index];
 
-    // 2. 퍼저 입력으로부터 하이퍼콜 파라미터 값들 읽기 (ic_ingest* 사용)
-    if (ic_ingest32(&connection_id, 0, 0xFFFFFFFF)) return false;
+    // 2. 퍼저 입력으로부터 하이퍼콜 파라미터 값들 읽기
+    uint32_t id_24bit_part; // HV_CONNECTION_ID의 실제 ID 부분 (하위 24비트)
+    // ic_ingest32로 0x00000000 ~ 0x00FFFFFF 범위의 값을 읽어옴
+    // 이 값은 output 버퍼에도 추가됨
+    if (ic_ingest32(&id_24bit_part, 0, 0x00FFFFFF)) return false; 
+    connection_id_val = id_24bit_part; // connection_id_val은 이제 상위 8비트가 0인 UINT32 값이 됨
+
+    // MessageType: MSB clear (0x0xxxxxxx), non-zero (1 ~ 0x7FFFFFFF 범위)
     if (ic_ingest32(&message_type, 1, 0x7FFFFFFF)) return false; 
+    // PayloadSize: 0 ~ 240 범위
     if (ic_ingest32(&payload_size, 0, 240)) return false; 
+
+    // 페이로드 데이터 읽기 (실제 payload_size 만큼)
     if (payload_size > 0) {
         uint8_t* ingested_payload_ptr = ic_ingest_len(payload_size);
         if (!ingested_payload_ptr) return false;
@@ -788,13 +800,14 @@ bool op_hvcall_post_message() {
 
     // 3. L2 게스트 메모리(param_gpa)에 파라미터 블록 구성
     bx_address param_hpa;
-    int translation_level;
+    int translation_level; 
     if (vmcs_translate_guest_physical_ept(param_gpa, &param_hpa, &translation_level) != 0) {
         printf("Error: Failed to translate GPA 0x%llx for HvCallPostMessage params.\n", (unsigned long long)param_gpa);
         return false; 
     }
     uint32_t rsvdz_at_offset4 = 0;
-    cpu_physical_memory_write(param_hpa + 0,  &connection_id, sizeof(connection_id));
+    // cpu_physical_memory_write 호출 시 connection_id_val 사용
+    cpu_physical_memory_write(param_hpa + 0,  &connection_id_val, sizeof(connection_id_val)); // 수정됨: connection_id -> connection_id_val
     cpu_physical_memory_write(param_hpa + 4,  &rsvdz_at_offset4, sizeof(rsvdz_at_offset4));
     cpu_physical_memory_write(param_hpa + 8,  &message_type, sizeof(message_type));
     cpu_physical_memory_write(param_hpa + 12, &payload_size, sizeof(payload_size));
@@ -803,13 +816,13 @@ bool op_hvcall_post_message() {
     }
     
     // 4. RCX (하이퍼콜 입력 값) 및 RDX (파라미터 GPA) 설정 준비
-    uint64_t hypercall_input_value = 0x005C; 
+    uint64_t hypercall_input_value = 0x005C; // Call Code: 0x005C, Fast=0 등 기본값
     memcpy(vmcall_gpregs, BX_CPU(id)->gen_reg, sizeof(BX_CPU(id)->gen_reg)); 
     vmcall_gpregs[BX_64BIT_REG_RCX].rrx = hypercall_input_value;
     vmcall_gpregs[BX_64BIT_REG_RDX].rrx = param_gpa;             
-    // vmcall_gpregs[BX_64BIT_REG_R8].rrx = 0; 
+    // vmcall_gpregs[BX_64BIT_REG_R8].rrx = 0; // 이 하이퍼콜은 R8을 명시적으로 사용 안 함
 
-    // 5. VMCALL 주입 및 실행 준비
+    // 5. VMCALL 주입 및 실행 준비 (이전과 동일)
     BX_CPU(id)->VMwrite32(VMCS_32BIT_VMEXIT_REASON, VMX_VMEXIT_VMCALL);
     BX_CPU(id)->VMwrite32(VMCS_32BIT_VMEXIT_INSTRUCTION_LENGTH, 3);
     bx_address phy_guest_rip;
@@ -819,62 +832,203 @@ bool op_hvcall_post_message() {
     }
     cpu_physical_memory_write(phy_guest_rip, "\x0f\x01\xc1", 3); 
 
-    // 6. 준비된 레지스터 값을 실제 Bochs CPU 레지스터로 복사
+    // 6. 준비된 레지스터 값을 실제 Bochs CPU 레지스터로 복사 (이전과 동일)
     memcpy(BX_CPU(id)->gen_reg, vmcall_gpregs, sizeof(BX_CPU(id)->gen_reg));
 
     // --- 입력 재구성을 위한 DMA 데이터 캡처 준비 ---
-    // start_cpu() 호출 직전에 output 버퍼의 현재 커서 위치를 기록합니다.
-    // fuzz_dma_read_cb 내의 ic_ingest_buf 호출은 이 커서 이후로 output에 DMA 데이터를 추가합니다.
     uint8_t *dma_data_output_start_cursor = ic_get_cursor();
 
     // 7. CPU 에뮬레이션 시작
     start_cpu(); 
 
-    // 8. 하이퍼콜 반환 값(RAX) 확인 (선택적 로깅)
+    // 8. 하이퍼콜 반환 값(RAX) 확인 (선택적 로깅 - 이전과 동일, 필요시 상세화)
     uint64_t rax_return_value = BX_CPU(id)->get_reg64(BX_64BIT_REG_RAX);
     uint16_t hv_status = (uint16_t)(rax_return_value & 0xFFFF);
-    if (BX_CPU(id)->fuzztrace || log_ops || hv_status != HV_STATUS_SUCCESS) { /* 로깅 */ }
+    if (BX_CPU(id)->fuzztrace || log_ops || hv_status != HV_STATUS_SUCCESS) { 
+        printf("!HvCallPostMessage (0x005C) Attempted with GPA: 0x%llx, ConnID: 0x%08x, MsgType: 0x%08x, PayloadSize: %u\n",
+               (unsigned long long)param_gpa, connection_id_val, message_type, payload_size);
+        printf("  Returned: RAX=0x%016llx (Status=0x%04x - %s)\n",
+               (unsigned long long)rax_return_value, hv_status, hv_status_to_string(hv_status));
+        // ... (필요시 HV_STATUS_INVALID_PARAMETER 세부 로깅) ...
+    }
 
     // --- 9. 입력 재구성 로직 (op_vmcall과 유사하게) ---
-    // VMCALL 실행 중 fuzz_dma_read_cb에 의해 output 버퍼에 추가되었을 수 있는 DMA 데이터 길이 계산
     uint8_t *dma_data_output_end_cursor = ic_get_cursor();
     size_t dma_data_length_in_output = dma_data_output_end_cursor - dma_data_output_start_cursor;
     
-    uint8_t temp_dma_buffer[4096]; // 임시 DMA 버퍼
+    uint8_t temp_dma_buffer[4096]; 
     if (dma_data_length_in_output > sizeof(temp_dma_buffer)) {
-        printf("Warning: DMA data too large for temp_dma_buffer in op_hvcall_post_message.\n");
-        dma_data_length_in_output = sizeof(temp_dma_buffer); // 잘림 방지
+        printf("Warning: DMA data (0x%zx bytes) too large for temp_dma_buffer in op_hvcall_post_message. Truncating.\n", dma_data_length_in_output);
+        dma_data_length_in_output = sizeof(temp_dma_buffer); 
     }
     if (dma_data_length_in_output > 0) {
         memcpy(temp_dma_buffer, dma_data_output_start_cursor, dma_data_length_in_output);
     }
 
-    // 현재 작업(이 op_hvcall_post_message)을 위해 output 버퍼에 추가된 모든 내용을
-    // (마지막 SEPARATOR 이후부터 현재 커서까지) 일단 삭제합니다.
     ic_erase_backwards_until_token(); 
 
     uint8_t current_opcode = OP_HVCALL_POSTMESSAGE;
-    if (!ic_append(&current_opcode, sizeof(current_opcode))) goto reconstruction_error;
+    if (!ic_append(&current_opcode, sizeof(current_opcode))) goto reconstruction_error_pm;
 
-    // 사용된 파라미터 값들을 순서대로 output 버퍼에 추가
-    if (!ic_append(&scratch_page_index, sizeof(scratch_page_index))) goto reconstruction_error;
-    if (!ic_append(&connection_id, sizeof(connection_id))) goto reconstruction_error;
-    if (!ic_append(&message_type, sizeof(message_type))) goto reconstruction_error;
-    if (!ic_append(&payload_size, sizeof(payload_size))) goto reconstruction_error;
+    // 사용된 파라미터 값들을 순서대로 output 버퍼에 다시 기록 (ic_ingest*가 이미 output에 추가했으므로,
+    // 해당 값들이 output 버퍼의 현재 위치 이전에 올바르게 존재하고 있음.
+    // ic_erase_backwards_until_token()은 마지막 SEPARATOR까지 지우므로,
+    // 이 작업의 op_code와 파라미터들이 담긴 부분은 이미 지워진 상태.
+    // 따라서, 사용된 값들을 다시 append 해주어야 함.)
+    if (!ic_append(&scratch_page_index, sizeof(scratch_page_index))) goto reconstruction_error_pm;
+    // connection_id_val은 id_24bit_part를 통해 ic_ingest32에서 이미 output에 기록됨.
+    // 하지만 ic_erase_backwards_until_token()으로 지워졌으므로 여기서 다시 추가.
+    // 이때, ic_ingest32가 output에 추가한 형식과 동일하게 추가해야 함 (UINT32로).
+    if (!ic_append(&id_24bit_part, sizeof(id_24bit_part))) goto reconstruction_error_pm; // 또는 connection_id_val
+    if (!ic_append(&message_type, sizeof(message_type))) goto reconstruction_error_pm;
+    if (!ic_append(&payload_size, sizeof(payload_size))) goto reconstruction_error_pm;
     if (payload_size > 0) {
-        if (!ic_append(message_payload, payload_size)) goto reconstruction_error;
+        if (!ic_append(message_payload, payload_size)) goto reconstruction_error_pm;
     }
 
     // 이 하이퍼콜 실행 중에 소비/주입된 DMA 데이터가 있다면, 그것도 output 버퍼에 추가
     if (dma_data_length_in_output > 0) {
-        if (!ic_append(temp_dma_buffer, dma_data_length_in_output)) goto reconstruction_error;
+        if (!ic_append(temp_dma_buffer, dma_data_length_in_output)) goto reconstruction_error_pm;
     }
 
-    return true; // 작업 성공
+    return true;
 
-reconstruction_error:
-    fuzz_emu_stop_unhealthy(); // 입력 재구성 실패 시 비정상 종료 처리
+reconstruction_error_pm: // 레이블 이름 충돌 방지를 위해 _pm 추가
+    fuzz_emu_stop_unhealthy(); 
     return false;
+}
+
+// HvCallSignalEvent (0x005D)를 위한 op 함수 (HV_CONNECTION_ID 제약 조건 반영)
+bool op_hvcall_signal_event() {
+    uint32_t connection_id_val; // HV_CONNECTION_ID의 AsUInt32에 해당, 상위 8비트는 0으로 처리
+    uint16_t flag_number;
+    bx_phy_address param_gpa; // 파라미터 블록을 저장할 L2 GPA
+
+    // --- 1. 파라미터 블록으로 사용할 L2 GPA 확보 (스크래치 리스트에서 무작위 선택) ---
+    if (guest_page_scratchlist.empty()) {
+        printf("Error: No scratch pages available for HvCallSignalEvent params.\n");
+        return false; 
+    }
+    uint8_t scratch_page_index = 0; // 기본값
+    if (guest_page_scratchlist.size() > 1) { 
+        // 입력 스트림에서 인덱스 값을 읽어옴 (0 ~ 리스트크기-1 범위)
+        if (ic_ingest8(&scratch_page_index, 0, guest_page_scratchlist.size() - 1)) {
+            scratch_page_index = 0; // 입력 부족 시 기본값 사용
+        }
+    }
+    param_gpa = guest_page_scratchlist[scratch_page_index];
+    // --- GPA 선택 로직 끝 ---
+
+    // 2. 퍼저 입력으로부터 하이퍼콜 파라미터 값들 읽기
+    uint32_t id_24bit_part; // HV_CONNECTION_ID의 실제 ID 부분 (하위 24비트)
+    // ic_ingest32로 0x00000000 ~ 0x00FFFFFF 범위의 값을 읽어옴 (output 버퍼에도 추가됨)
+    if (ic_ingest32(&id_24bit_part, 0, 0x00FFFFFF)) return false; 
+    connection_id_val = id_24bit_part; // connection_id_val은 이제 상위 8비트가 0인 UINT32 값이 됨
+
+    // FlagNumber: UINT16 범위. 
+    // TLFS는 "port’s flag count" 미만이어야 한다고 하지만, 실제 값을 알 수 없으므로 전체 범위 퍼징.
+    if (ic_ingest16(&flag_number, 0, 0xFFFF)) return false; 
+
+    // 3. L2 게스트 메모리(param_gpa)에 파라미터 블록 구성
+    bx_address param_hpa; // param_gpa에 해당하는 HPA
+    int translation_level;
+    if (vmcs_translate_guest_physical_ept(param_gpa, &param_hpa, &translation_level) != 0) {
+        printf("Error: Failed to translate GPA 0x%llx for HvCallSignalEvent params.\n", (unsigned long long)param_gpa);
+        return false; 
+    }
+
+    // 파라미터 블록을 HPA에 TLFS 명세에 따라 기록
+    uint16_t rsvdz_at_offset6 = 0; // 예약된 필드는 0으로 설정
+
+    // ConnectionId (상위 8비트가 0으로 처리된 값)를 파라미터 블록에 씀
+    cpu_physical_memory_write(param_hpa + 0, &connection_id_val, sizeof(connection_id_val)); // Offset 0: ConnectionId (4 bytes)
+    cpu_physical_memory_write(param_hpa + 4, &flag_number,       sizeof(flag_number));       // Offset 4: FlagNumber (2 bytes)
+    cpu_physical_memory_write(param_hpa + 6, &rsvdz_at_offset6,  sizeof(rsvdz_at_offset6));  // Offset 6: RsvdZ (2 bytes)
+    
+    // 4. RCX (하이퍼콜 입력 값) 및 RDX (파라미터 GPA) 설정 준비
+    uint64_t hypercall_input_value = 0x005D; // Call Code: 0x005D, Fast Flag = 0 등 기본값
+    
+    memcpy(vmcall_gpregs, BX_CPU(id)->gen_reg, sizeof(BX_CPU(id)->gen_reg)); // GPR 백업
+    vmcall_gpregs[BX_64BIT_REG_RCX].rrx = hypercall_input_value; // RCX 설정
+    vmcall_gpregs[BX_64BIT_REG_RDX].rrx = param_gpa;             // RDX 설정 (파라미터 블록 GPA)
+    // vmcall_gpregs[BX_64BIT_REG_R8].rrx = 0; // R8은 메모리 기반 호출 시 명시적 사용 안함
+
+    // 5. VMCALL 주입 및 실행 준비 (기존과 동일)
+    BX_CPU(id)->VMwrite32(VMCS_32BIT_VMEXIT_REASON, VMX_VMEXIT_VMCALL);
+    BX_CPU(id)->VMwrite32(VMCS_32BIT_VMEXIT_INSTRUCTION_LENGTH, 3); 
+
+    bx_address phy_guest_rip;
+    if (vmcs_linear2phy(BX_CPU(id)->VMread64(VMCS_GUEST_RIP), &phy_guest_rip) == 0) {
+        printf("Error: Failed to translate GUEST_RIP for VMCALL injection.\n");
+        return false;
+    }
+    cpu_physical_memory_write(phy_guest_rip, "\x0f\x01\xc1", 3); // GUEST_RIP에 VMCALL 명령어 삽입
+
+    // 6. 준비된 레지스터 값을 실제 Bochs CPU 레지스터로 복사 (기존과 동일)
+    memcpy(BX_CPU(id)->gen_reg, vmcall_gpregs, sizeof(BX_CPU(id)->gen_reg));
+
+    // --- 입력 재구성을 위한 DMA 데이터 캡처 준비 ---
+    uint8_t *dma_data_output_start_cursor = ic_get_cursor();
+    // --- DMA 데이터 캡처 준비 끝 ---
+
+    // 7. CPU 에뮬레이션 시작
+    start_cpu(); 
+
+    // 8. 하이퍼콜 반환 값(RAX) 확인 및 상세 로깅
+    uint64_t rax_return_value = BX_CPU(id)->get_reg64(BX_64BIT_REG_RAX);
+    uint16_t hv_status = (uint16_t)(rax_return_value & 0xFFFF);
+    if (BX_CPU(id)->fuzztrace || log_ops || hv_status != HV_STATUS_SUCCESS) {
+        printf("!HvCallSignalEvent (0x005D) Attempted with GPA: 0x%llx, ConnID: 0x%08x, FlagNum: 0x%04x\n",
+               (unsigned long long)param_gpa, connection_id_val, flag_number);
+        printf("  Returned: RAX=0x%016llx (Status=0x%04x - %s)\n",
+               (unsigned long long)rax_return_value, 
+               hv_status, 
+               hv_status_to_string(hv_status)); // hv_status_to_string 헬퍼 함수 사용
+        // HV_STATUS_INVALID_PARAMETER의 경우, TLFS에 명시된 세부 조건 로깅 추가
+        if (hv_status == HV_STATUS_INVALID_PARAMETER) {
+             printf("    Detail: Potentially, specified flag number (0x%04x) is invalid (e.g., >= port's flag count).\n", flag_number);
+        }
+    }
+
+    // --- 9. 입력 재구성 로직 ---
+    uint8_t *dma_data_output_end_cursor = ic_get_cursor();
+    size_t dma_data_length_in_output = dma_data_output_end_cursor - dma_data_output_start_cursor;
+    
+    uint8_t temp_dma_buffer[4096]; // 임시 DMA 버퍼
+    if (dma_data_length_in_output > sizeof(temp_dma_buffer)) {
+        printf("Warning: DMA data (0x%zx bytes) too large for temp_dma_buffer in op_hvcall_signal_event. Truncating.\n", dma_data_length_in_output);
+        dma_data_length_in_output = sizeof(temp_dma_buffer);
+    }
+    if (dma_data_length_in_output > 0) {
+        memcpy(temp_dma_buffer, dma_data_output_start_cursor, dma_data_length_in_output);
+    }
+
+    ic_erase_backwards_until_token(); // 이 작업으로 output에 추가된 내용 삭제
+
+    // 정제된 작업 정보 output 버퍼에 다시 기록
+    uint8_t current_opcode = OP_HVCALL_SIGNALEVENT; // 현재 작업 코드 명시
+    if (!ic_append(&current_opcode, sizeof(current_opcode))) goto reconstruction_error_se;
+
+    // 사용된 파라미터 값들을 순서대로 output 버퍼에 추가
+    // ic_ingest* 함수들이 이미 output 버퍼에 올바른(제약된) 값을 기록했으므로,
+    // 해당 값들을 참조하는 변수를 append하는 것이 아니라,
+    // ic_ingest*가 기록한 그 '길이'만큼을 유지하도록 해야 함.
+    // 여기서는 scratch_page_index, id_24bit_part(connection_id용), flag_number 순으로 append.
+    if (!ic_append(&scratch_page_index, sizeof(scratch_page_index))) goto reconstruction_error_se;
+    if (!ic_append(&id_24bit_part, sizeof(id_24bit_part))) goto reconstruction_error_se; // connection_id_val 대신 id_24bit_part
+    if (!ic_append(&flag_number, sizeof(flag_number))) goto reconstruction_error_se;
+
+    // 이 하이퍼콜 실행 중에 소비/주입된 DMA 데이터가 있다면, 그것도 output 버퍼에 추가
+    if (dma_data_length_in_output > 0) {
+        if (!ic_append(temp_dma_buffer, dma_data_length_in_output)) goto reconstruction_error_se;
+    }
+
+    return true;
+
+reconstruction_error_se: // 레이블 이름 변경
+    fuzz_emu_stop_unhealthy();
+    return false;
+    // --- 입력 재구성 로직 끝 ---
 }
 
 bool op_clock_step() {
@@ -908,6 +1062,7 @@ void fuzz_run_input(const uint8_t *Data, size_t Size) {
 		[OP_MSR_WRITE] = op_msr_write,
 		[OP_VMCALL] = op_vmcall,
 		[OP_HVCALL_POSTMESSAGE] = op_hvcall_post_message,
+		[OP_HVCALL_SIGNALEVENT] = op_hvcall_signal_event,
 	};
 	static const int nr_ops = sizeof(ops) / sizeof((ops)[0]);
 	uint8_t op;
@@ -953,7 +1108,7 @@ void fuzz_run_input(const uint8_t *Data, size_t Size) {
             min_op_for_ingest = OP_MSR_WRITE;
             if (is_hyperv_target) {
                 // HYPERV=1이면, OP_HVCALL_POSTMESSAGE까지 작업 선택 가능
-                max_op_for_ingest = OP_HVCALL_POSTMESSAGE; 
+                max_op_for_ingest = OP_HVCALL_SIGNALEVENT; 
             } else {
                 // HYPERV=1이 아니면, OP_VMCALL까지만 작업 선택 가능
                 max_op_for_ingest = OP_VMCALL; 
@@ -963,7 +1118,7 @@ void fuzz_run_input(const uint8_t *Data, size_t Size) {
             if (is_hyperv_target) {
                 // HYPERV=1이면, OP_HVCALL_POSTMESSAGE까지 작업 선택 가능
                 // (OP_CLOCK_STEP은 이 로직에서 제외하고, 루프 후 별도 처리)
-                max_op_for_ingest = OP_HVCALL_POSTMESSAGE; 
+                max_op_for_ingest = OP_HVCALL_SIGNALEVENT; 
             } else {
                 // HYPERV=1이 아니면, OP_VMCALL까지만 작업 선택 가능
                 // (OP_HVCALL_POSTMESSAGE는 이 범위에서 제외됨)
