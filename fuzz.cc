@@ -844,11 +844,11 @@ bool op_hvcall_post_message() {
     // 8. 하이퍼콜 반환 값(RAX) 확인 (선택적 로깅 - 이전과 동일, 필요시 상세화)
     uint64_t rax_return_value = BX_CPU(id)->get_reg64(BX_64BIT_REG_RAX);
     uint16_t hv_status = (uint16_t)(rax_return_value & 0xFFFF);
-    if (BX_CPU(id)->fuzztrace || log_ops || hv_status != HV_STATUS_SUCCESS) { 
+    if (BX_CPU(id)->fuzztrace || log_ops) { 
         printf("!HvCallPostMessage (0x005C) Attempted with GPA: 0x%llx, ConnID: 0x%08x, MsgType: 0x%08x, PayloadSize: %u\n",
                (unsigned long long)param_gpa, connection_id_val, message_type, payload_size);
-        printf("  Returned: RAX=0x%016llx (Status=0x%04x - %s)\n",
-               (unsigned long long)rax_return_value, hv_status, hv_status_to_string(hv_status));
+        printf("  Returned: RAX=0x%016llx (Status=0x%04x)\n",
+               (unsigned long long)rax_return_value, hv_status);
         // ... (필요시 HV_STATUS_INVALID_PARAMETER 세부 로깅) ...
     }
 
@@ -977,17 +977,12 @@ bool op_hvcall_signal_event() {
     // 8. 하이퍼콜 반환 값(RAX) 확인 및 상세 로깅
     uint64_t rax_return_value = BX_CPU(id)->get_reg64(BX_64BIT_REG_RAX);
     uint16_t hv_status = (uint16_t)(rax_return_value & 0xFFFF);
-    if (BX_CPU(id)->fuzztrace || log_ops || hv_status != HV_STATUS_SUCCESS) {
+    if (BX_CPU(id)->fuzztrace || log_ops) {
         printf("!HvCallSignalEvent (0x005D) Attempted with GPA: 0x%llx, ConnID: 0x%08x, FlagNum: 0x%04x\n",
                (unsigned long long)param_gpa, connection_id_val, flag_number);
-        printf("  Returned: RAX=0x%016llx (Status=0x%04x - %s)\n",
+        printf("  Returned: RAX=0x%016llx (Status=0x%04x)\n",
                (unsigned long long)rax_return_value, 
-               hv_status, 
-               hv_status_to_string(hv_status)); // hv_status_to_string 헬퍼 함수 사용
-        // HV_STATUS_INVALID_PARAMETER의 경우, TLFS에 명시된 세부 조건 로깅 추가
-        if (hv_status == HV_STATUS_INVALID_PARAMETER) {
-             printf("    Detail: Potentially, specified flag number (0x%04x) is invalid (e.g., >= port's flag count).\n", flag_number);
-        }
+               hv_status); 
     }
 
     // --- 9. 입력 재구성 로직 ---
@@ -1053,25 +1048,25 @@ bool op_clock_step() {
 
 extern bool fuzz_unhealthy_input, fuzz_do_not_continue, fuzz_should_abort;
 void fuzz_run_input(const uint8_t *Data, size_t Size) {
-	bool (*ops[])() = {
-		[OP_READ] = op_read,
-		[OP_WRITE] = op_write,
-		[OP_IN] = op_in,
-		[OP_OUT] = op_out,
-		[OP_PCI_WRITE] = op_pci_write,
-		[OP_MSR_WRITE] = op_msr_write,
-		[OP_VMCALL] = op_vmcall,
-		[OP_HVCALL_POSTMESSAGE] = op_hvcall_post_message,
-		[OP_HVCALL_SIGNALEVENT] = op_hvcall_signal_event,
-	};
-	static const int nr_ops = sizeof(ops) / sizeof((ops)[0]);
-	uint8_t op;
+    bool (*ops[])() = {
+        [OP_READ] = op_read,
+        [OP_WRITE] = op_write,
+        [OP_IN] = op_in,
+        [OP_OUT] = op_out,
+        [OP_PCI_WRITE] = op_pci_write,
+        [OP_MSR_WRITE] = op_msr_write,
+        [OP_VMCALL] = op_vmcall,
+        [OP_HVCALL_POSTMESSAGE] = op_hvcall_post_message,
+        [OP_HVCALL_SIGNALEVENT] = op_hvcall_signal_event,
+    };
+    // static const int nr_ops = sizeof(ops) / sizeof((ops)[0]); // 이 줄은 현재 코드에서 사용되지 않음
 
-	static void *fuzz_legacy, *fuzz_hypercalls, *end_with_clockstep;
-	static int inited;
-	static bool is_hyperv_target = false;
+    static void *fuzz_legacy, *fuzz_hypercalls, *end_with_clockstep;
+    static int inited;
+    static bool is_hyperv_target = false;
 
     if (!inited) {
+        // ... (inited 블록 내용은 동일) ...
         inited = 1;
         fuzz_legacy = getenv("FUZZ_LEGACY");
         fuzz_hypercalls = getenv("FUZZ_HYPERCALLS");
@@ -1087,70 +1082,68 @@ void fuzz_run_input(const uint8_t *Data, size_t Size) {
         }
     }
 
-	//if (log_ops)
-		//printf("!new input (length %d)\n", Size);
-	ic_new_input(Data, Size);
-	uint16_t start = 0;
-	// int nops = 0;
-	uint8_t *input_start = ic_get_cursor();
-	do {
-		dma_start = ic_get_cursor() - input_start;
-		dma_len = 0;
+    ic_new_input(Data, Size);
+    uint16_t start = 0;
+    uint8_t *input_start = ic_get_cursor();
+
+    // num_defined_ops 선언을 루프 시작 전 또는 루프의 맨 위로 이동
+    const size_t num_defined_ops = sizeof(ops) / sizeof(ops[0]);
+
+    do {
+        uint8_t op;
+        dma_start = ic_get_cursor() - input_start; // dma_start, dma_len은 전역변수로 가정
+        dma_len = 0;
 
         uint8_t min_op_for_ingest;
         uint8_t max_op_for_ingest;
 
-		uint8_t max_op_code = OP_HVCALL_POSTMESSAGE;
-		if (fuzz_legacy) {
+        // ... (min_op_for_ingest, max_op_for_ingest 설정 로직은 동일) ...
+        if (fuzz_legacy) {
             min_op_for_ingest = OP_READ;
             max_op_for_ingest = OP_OUT;
-		} else if (fuzz_hypercalls) {
+        } else if (fuzz_hypercalls) {
             min_op_for_ingest = OP_MSR_WRITE;
             if (is_hyperv_target) {
-                // HYPERV=1이면, OP_HVCALL_POSTMESSAGE까지 작업 선택 가능
                 max_op_for_ingest = OP_HVCALL_SIGNALEVENT; 
             } else {
-                // HYPERV=1이 아니면, OP_VMCALL까지만 작업 선택 가능
                 max_op_for_ingest = OP_VMCALL; 
             }
-		} else { /* Fuzz Everything */
-            min_op_for_ingest = 0; // 가장 작은 작업 코드부터
+        } else { /* Fuzz Everything */
+            min_op_for_ingest = 0; 
             if (is_hyperv_target) {
-                // HYPERV=1이면, OP_HVCALL_POSTMESSAGE까지 작업 선택 가능
-                // (OP_CLOCK_STEP은 이 로직에서 제외하고, 루프 후 별도 처리)
                 max_op_for_ingest = OP_HVCALL_SIGNALEVENT; 
             } else {
-                // HYPERV=1이 아니면, OP_VMCALL까지만 작업 선택 가능
-                // (OP_HVCALL_POSTMESSAGE는 이 범위에서 제외됨)
                 max_op_for_ingest = OP_VMCALL;
             }
-		}
+        }
+
 
         if (ic_ingest8(&op, min_op_for_ingest, max_op_for_ingest, true)) {
             goto handle_op_failure_and_continue;
         }
 
-        size_t num_defined_ops = sizeof(ops) / sizeof(ops[0]);
+        // ops 배열 범위 및 유효한 함수 포인터 확인 후 작업 실행
         if (op >= num_defined_ops || !ops[op] || !ops[op]()) { 
-        handle_op_failure_and_continue:
+        handle_op_failure_and_continue: // 레이블 위치는 그대로 둠
             ic_erase_backwards_until_token();
             ic_subtract(4); 
             continue;
         }
-		
-		if (fuzz_unhealthy_input || fuzz_do_not_continue)
-			break;
-		if (new_op(op, start, ic_get_cursor() - input_start, dma_start,
-			   dma_len) >= 8)
-			break;
-	} while (ic_advance_until_token(SEPARATOR, 4));
+        
+        if (fuzz_unhealthy_input || fuzz_do_not_continue)
+            break;
+        if (new_op(op, start, (uint32_t)(ic_get_cursor() - input_start), dma_start,
+               dma_len) >= 8) // 캐스팅 추가 (ic_get_cursor() - input_start의 타입이 ptrdiff_t일 수 있으므로)
+            break;
+    } while (ic_advance_until_token((const char*)SEPARATOR, sizeof(SEPARATOR))); // SEPARATOR 타입캐스팅 추가
 
-	if (end_with_clockstep)
-		op_clock_step();
+    if (end_with_clockstep)
+        op_clock_step();
 
-	size_t dummy;
-	uint8_t *output = ic_get_output(&dummy); // Set the output and op log
+    size_t dummy;
+    uint8_t *output = ic_get_output(&dummy); 
 }
+
 
 void add_pio_region(uint16_t addr, uint16_t size) {
 	pio_regions[addr] = size;
